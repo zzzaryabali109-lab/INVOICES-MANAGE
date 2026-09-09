@@ -1,0 +1,6 @@
+{
+  "name": "Invoiceseeker",
+  "description": "Track shipping containers in real-time and generate invoices across major shipping lines.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

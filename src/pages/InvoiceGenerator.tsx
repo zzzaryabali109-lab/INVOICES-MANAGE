@@ -28,6 +28,11 @@ import {
   extractRawTextFromPdf,
   parseBlText,
   sanitizeAndVerifyBlData,
+  selectCompleteVesselName,
+  validateFullVesselValue,
+  splitVesselVoyagePol,
+  cleanVoyageValue,
+  cleanPortOfLoading,
 } from '@/lib/pdfBlExtractor';
 import { compressBlFile } from '@/lib/pdfCompressor';
 
@@ -83,6 +88,7 @@ interface BLData {
   container_size: string | null;
   bl_number: string | null;
   vessel_name: string | null;
+  voyage?: string | null;
   hs_code: string | null;
   shipping_marks: string | null;
   bl_date: string | null;
@@ -691,18 +697,18 @@ export const multiplyDecimalStrings = (a: string, b: string, maxDecimals = 3) =>
 };
 
 
-export const formatCalculatedDecimal = (normalized: string, minimumFractionDigits = 2) => {
-  const [integerPart = '0', decimalPart = ''] = normalized.split('.');
-  const trimmedDecimal = decimalPart.replace(/0+$/, '');
-  const finalDecimal = trimmedDecimal.length
-    ? trimmedDecimal.length < minimumFractionDigits
-      ? trimmedDecimal.padEnd(minimumFractionDigits, '0')
-      : trimmedDecimal
-    : minimumFractionDigits
-      ? ''.padEnd(minimumFractionDigits, '0')
-      : '';
+export const stripTrailingZeros = (value: string | number | null | undefined): string => {
+  if (value === null || value === undefined || value === '') return '';
+  const str = String(value).trim();
+  if (!str.includes('.')) return str;
+  return str
+    .replace(/(\.\d*?[1-9])0+(?=[^\d]|$)/g, '$1')
+    .replace(/\.0+(?=[^\d]|$)/g, '');
+};
 
-  return finalDecimal ? `${integerPart}.${finalDecimal}` : integerPart;
+export const formatCalculatedDecimal = (normalized: string, _minimumFractionDigits = 0) => {
+  if (!normalized) return '';
+  return stripTrailingZeros(normalized);
 };
 
 export const parseExactAmountInput = (value: string) => {
@@ -716,11 +722,13 @@ export const parseExactAmountInput = (value: string) => {
 };
 
 export const formatExactAmount = (normalized: string) => {
-  const [integerPart = '0', decimalPart] = normalized.split('.');
+  if (!normalized) return '';
+  const clean = stripTrailingZeros(normalized);
+  const [integerPart = '0', decimalPart] = clean.split('.');
   const sanitizedInteger = (integerPart || '0').replace(/^0+(?=\d)/, '') || '0';
   const groupedInteger = sanitizedInteger.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 
-  return decimalPart !== undefined ? `${groupedInteger}.${decimalPart}` : groupedInteger;
+  return decimalPart !== undefined && decimalPart !== '' ? `${groupedInteger}.${decimalPart}` : groupedInteger;
 };
 
 const MONTH_MAP: Record<string, string> = {
@@ -976,6 +984,11 @@ const handleTemplateUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
 
       // Merge and cross-verify with document ground truth
       if (localExtracted && data) {
+        const fullVessel = selectCompleteVesselName(
+          data.vessel_name,
+          localExtracted.vessel_name,
+          rawPdfText || data.raw_text
+        );
         data = {
           ...localExtracted,
           ...data,
@@ -990,15 +1003,18 @@ const handleTemplateUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
             ]),
           ),
           bl_number: data.bl_number || localExtracted.bl_number,
-          vessel_name: data.vessel_name || localExtracted.vessel_name,
+          vessel_name: fullVessel || data.vessel_name || localExtracted.vessel_name,
+          voyage: data.voyage || localExtracted.voyage,
           port_of_loading: data.port_of_loading || localExtracted.port_of_loading,
           port_of_discharge: data.port_of_discharge || localExtracted.port_of_discharge,
           shipper: data.shipper || localExtracted.shipper,
           consignee: data.consignee || localExtracted.consignee,
           notify_party: data.notify_party || localExtracted.notify_party,
+          raw_text: rawPdfText || data.raw_text || localExtracted.raw_text,
         };
         data = sanitizeAndVerifyBlData(data, rawPdfText);
       } else if (rawPdfText && data) {
+        data.raw_text = rawPdfText || data.raw_text;
         data = sanitizeAndVerifyBlData(data, rawPdfText);
       }
 
@@ -1046,14 +1062,28 @@ const handleTemplateUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
       const finalDescription = composed.lines.length > 0 && composed.text ? composed.text : cleanedDescription;
       const finalHsCode = composed.lines.length > 0 ? (data?.hs_code || '') : (data?.hs_code || composed.primaryHs || '');
 
+      const separated = splitVesselVoyagePol(data?.vessel_name, data?.port_of_loading);
+      let validatedVessel = validateFullVesselValue(separated.vessel, rawPdfText || (data as any)?.raw_text);
+      const validatedVoyage = cleanVoyageValue(data?.voyage || separated.voyage);
+      const validatedPol = cleanPortOfLoading(data?.port_of_loading || separated.port_of_loading);
+
+      // CRITICAL: Ensure Vessel preserves the complete text under "VESSEL AND VOYAGE NUMBER"
+      if (validatedVoyage && validatedVessel && !validatedVessel.toUpperCase().includes(validatedVoyage.toUpperCase())) {
+        validatedVessel = `${validatedVessel} ${validatedVoyage}`.trim();
+      }
+
       const normalizedData = {
         ...data,
+        vessel_name: validatedVessel,
+        voyage: validatedVoyage,
+        port_of_loading: validatedPol,
         container_numbers: cleanContainerList(data?.container_numbers),
         notify_party: mergedNotify,
         notify_party_address: '',
         description: finalDescription,
         hs_code: finalHsCode,
         goods_lines: composed.lines,
+        raw_text: rawPdfText || (data as any)?.raw_text,
       };
 
       if (data.kgs) {
@@ -1099,7 +1129,7 @@ const handleTemplateUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
 
     return {
       unitPrice: unitPriceNum,
-      unitPriceText: unitPriceTextExact,
+      unitPriceText: stripTrailingZeros(unitPriceTextExact),
       totalPriceDisplay: formatExactAmount(computedTotalText),
       totalPriceText: computedTotalText,
       kgs: blData.kgs,
@@ -1290,7 +1320,7 @@ const generateInvoicePDF = async (calc: {
   drawField('notify_party', notifyBlock, 'NOTIFY PARTY', 8.5, { maxLines: 7 });
   drawField('consignee', consigneeBlock, 'CONSIGNEE', 8.5, { maxLines: 7 });
   drawField('container_info', [containerSize, containerNums].filter(Boolean).join('\n'), 'CONTAINER / SIZE', 9, { maxLines: 5 });
-  drawField('vessel', blData?.vessel_name || '', 'VESSEL / FLIGHT', 9, { maxLines: 2 });
+  drawField('vessel', validateFullVesselValue(blData?.vessel_name, (blData as any)?.raw_text), 'VESSEL / FLIGHT', 9, { maxLines: 2 });
   drawField('hs_code', blData?.hs_code || '', 'HS CODE', 9, { maxLines: 2 });
   drawField('port_of_loading', blData?.port_of_loading || '', 'PORT OF LOADING', 9, { maxLines: 3 });
   drawField('port_of_discharge', blData?.port_of_discharge || '', 'PORT OF DISCHARGE / DESTINATION', 9, { maxLines: 3 });
@@ -1304,19 +1334,19 @@ const generateInvoicePDF = async (calc: {
 
   drawField(
     'packages',
-    bales ? `${bales} BALES` : blData?.packages || '',
+    bales ? `${stripTrailingZeros(bales)} BALES` : blData?.packages || '',
     resolvedLayout.has_bales_packages === false ? 'PACKAGES' : 'NO. & KIND OF PKGS',
     10,
     { valueBold: true, valueAlign: 'center', maxLines: 2 },
   );
   drawField(
     'gross_weight',
-    `${calc.kgs.toFixed(4)} KGS`,
+    `${stripTrailingZeros(calc.kgs)} KGS`,
     resolvedLayout.has_weight_pricing === false ? 'WEIGHT' : 'G.WEIGHT',
     9.5,
     { valueAlign: 'right' },
   );
-  drawField('unit_price', `${calc.unitPriceText} US$ PER KG`, 'UNIT PRICE', 9.5, { valueAlign: 'right' });
+  drawField('unit_price', `${stripTrailingZeros(calc.unitPriceText)} US$ PER KG`, 'UNIT PRICE', 9.5, { valueAlign: 'right' });
   drawField('amount', `${calc.totalPriceDisplay} US$`, 'AMOUNT', 11, { valueBold: true, valueAlign: 'right' });
   drawField('reference', referenceBlock, 'REFERENCE', 8.5, { maxLines: 5 });
   drawField('company_name', blData?.shipper || 'COMPANY NAME', '', 10, { valueBold: true, valueAlign: 'center', maxLines: 1 });
@@ -1375,6 +1405,15 @@ const generateInvoicePDF = async (calc: {
       const containerSize = blData?.container_size || '';
       const bales = balesCount || blData?.bales || '';
 
+      // Validate that the complete extracted Vessel value is passed to Adobe PDF mapping
+      let fullVerifiedVessel = validateFullVesselValue(
+        blData?.vessel_name,
+        (blData as any)?.raw_text
+      );
+      if (blData?.voyage && fullVerifiedVessel && !fullVerifiedVessel.toUpperCase().includes(blData.voyage.toUpperCase())) {
+        fullVerifiedVessel = `${fullVerifiedVessel} ${blData.voyage}`.trim();
+      }
+
       // Adobe Document Generation merge tags
       const adobeData = {
         invoice_number: invNum,
@@ -1388,7 +1427,8 @@ const generateInvoicePDF = async (calc: {
         container_size: containerSize,
         container_numbers: containerNums,
         container_numbers_one: firstContainer,
-        vessel: blData?.vessel_name || '',
+        vessel: fullVerifiedVessel || blData?.vessel_name || '',
+        voyage: blData?.voyage || '',
         port_of_loading: blData?.port_of_loading || '',
         port_of_discharge: blData?.port_of_discharge || '',
         hs_code: blData?.hs_code || '',
@@ -1400,11 +1440,11 @@ const generateInvoicePDF = async (calc: {
             (blData as any)?.goods_lines?.[i]?.text || '',
           ]),
         ),
-        gross_weight: `${calc.kgs}KGS`,
-        unit_price: `${calc.unitPriceText}US$ Per KG`,
-        amount: `${calc.totalPriceText}$`,
+        gross_weight: `${stripTrailingZeros(calc.kgs)}KGS`,
+        unit_price: `${stripTrailingZeros(calc.unitPriceText)}US$ Per KG`,
+        amount: `${stripTrailingZeros(calc.totalPriceText)}$`,
         shipping_marks: blData?.shipping_marks || 'NIL',
-        packages: bales ? `${bales} BALES` : (blData?.packages || ''),
+        packages: bales ? `${stripTrailingZeros(bales)} BALES` : (blData?.packages || ''),
         company_name: blData?.shipper || '',
       };
 
@@ -1948,6 +1988,9 @@ const generateInvoicePDF = async (calc: {
                             {blData.vessel_name && (
                               <div><span className="text-slate-500">Vessel:</span> <span className="text-slate-900">{blData.vessel_name}</span></div>
                             )}
+                            {blData.voyage && (
+                              <div><span className="text-slate-500">Voyage:</span> <span className="text-slate-900">{blData.voyage}</span></div>
+                            )}
                             {blData.bl_number && (
                               <div><span className="text-slate-500">BL #:</span> <span className="text-slate-900">{blData.bl_number}</span></div>
                             )}
@@ -2097,8 +2140,12 @@ const generateInvoicePDF = async (calc: {
                           <Input value={blData.port_of_discharge ?? ''} onChange={(e) => setBlData({ ...blData, port_of_discharge: e.target.value })} className="h-9 rounded-lg" />
                         </div>
                         <div className="space-y-1">
-                          <Label className="text-xs text-slate-600">Vessel / Flight</Label>
+                          <Label className="text-xs text-slate-600">Vessel</Label>
                           <Input value={blData.vessel_name ?? ''} onChange={(e) => setBlData({ ...blData, vessel_name: e.target.value })} className="h-9 rounded-lg" />
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs text-slate-600">Voyage</Label>
+                          <Input value={blData.voyage ?? ''} onChange={(e) => setBlData({ ...blData, voyage: e.target.value })} className="h-9 rounded-lg" />
                         </div>
                         <div className="space-y-1">
                           <Label className="text-xs text-slate-600">HS Code</Label>
@@ -2236,7 +2283,7 @@ const generateInvoicePDF = async (calc: {
             <CardContent className="p-5 pt-0 space-y-2.5">
               {[
                 { label: 'Invoice Number', value: matchedRow?.invoice || invoiceNumber || '—', color: 'text-emerald-600', dot: 'bg-emerald-500' },
-                { label: 'Company Price', value: matchedRow?.price ? `$ ${matchedRow.price}` : (companyPrice ? `$ ${companyPrice}` : '—'), color: 'text-emerald-600', dot: 'bg-emerald-500' },
+                { label: 'Company Price', value: matchedRow?.price ? `$ ${stripTrailingZeros(matchedRow.price)}` : (companyPrice ? `$ ${stripTrailingZeros(companyPrice)}` : '—'), color: 'text-emerald-600', dot: 'bg-emerald-500' },
                 { label: 'Unit Price', value: calc ? `$ ${calc.unitPriceText}` : '—', color: 'text-emerald-600', dot: 'bg-emerald-500' },
                 { label: 'Currency', value: 'USD', color: 'text-amber-600', dot: 'bg-amber-500' },
               ].map((r) => (
@@ -2269,7 +2316,7 @@ const generateInvoicePDF = async (calc: {
                   <span className="w-2 h-2 rounded-full bg-emerald-500" />
                   <span className="text-sm text-slate-600">Weight (KGS)</span>
                 </div>
-                <span className="text-sm font-semibold text-slate-900">{calc ? calc.kgs : '—'}</span>
+                <span className="text-sm font-semibold text-slate-900">{calc ? stripTrailingZeros(calc.kgs) : '—'}</span>
               </div>
               <div className="flex items-center justify-between rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
                 <div className="flex items-center gap-2">

@@ -20,6 +20,7 @@ export interface ExtractedBLResult {
   container_size: string | null;
   bl_number: string | null;
   vessel_name: string | null;
+  voyage: string | null;
   port_of_loading: string | null;
   port_of_discharge: string | null;
   shipper: string | null;
@@ -204,23 +205,36 @@ export function parseBlText(rawText: string): ExtractedBLResult {
   // 7. Port of Loading (POL)
   let port_of_loading: string | null = null;
   const polMatch = rawText.match(
-    /(?:PORT\s+OF\s+LOADING|POL)\s*[:.-]?\s*([A-Z\s,.-]{3,35}?)(?:\s*(?:PORT\s+OF|POD|VESSEL|DATE|FINAL|\n|$))/i
+    /(?:PORT\s+OF\s+LOADING|POL\b|LOADING\s+PORT)\s*[:.-]?\s*([A-Z\s,.-]{2,50}?)(?:\s*(?:PORT\s+OF\s+DISCHARGE|POD\b|FINAL\s+DESTINATION|VESSEL|VOYAGE|DATE|PLACE\s+OF|\n|$))/i
   );
-  if (polMatch) port_of_loading = polMatch[1].trim();
+  if (polMatch) port_of_loading = cleanPortOfLoading(polMatch[1]);
 
   // 8. Port of Discharge (POD)
   let port_of_discharge: string | null = null;
   const podMatch = rawText.match(
-    /(?:PORT\s+OF\s+DISCHARGE|POD|FINAL\s+DESTINATION|PLACE\s+OF\s+DELIVERY)\s*[:.-]?\s*([A-Z\s,.-]{3,35}?)(?:\s*(?:PORT|DATE|FINAL|\n|$))/i
+    /(?:PORT\s+OF\s+DISCHARGE|POD\b|FINAL\s+DESTINATION|PLACE\s+OF\s+DELIVERY)\s*[:.-]?\s*([A-Z\s,.-]{2,50}?)(?:\s*(?:PORT|DATE|FINAL|VESSEL|\n|$))/i
   );
   if (podMatch) port_of_discharge = podMatch[1].trim();
 
-  // 9. Vessel Name
-  let vessel_name: string | null = null;
-  const vesselMatch = rawText.match(
-    /(?:VESSEL\s*(?:\/|\s*AND\s*)?VOYAGE|VESSEL\s*NAME|OCEAN\s*VESSEL)\s*[:.-]?\s*([A-Z0-9\s/._-]{3,30}?)(?:\s*(?:PORT|FLAG|VOYAGE\s*NO|\n|$))/i
-  );
-  if (vesselMatch) vessel_name = vesselMatch[1].trim();
+  // 9. Vessel and Voyage - preserve full Vessel and separate POL
+  const rawVesselCandidate = extractRawVesselFromText(rawText);
+  const rawVoyageCandidate = extractRawVoyageFromText(rawText);
+  const separated = splitVesselVoyagePol(rawVesselCandidate, port_of_loading);
+
+  let vessel_name: string | null = separated.vessel || null;
+  const voyage: string | null = cleanVoyageValue(rawVoyageCandidate || separated.voyage) || null;
+  if (!port_of_loading && separated.port_of_loading) {
+    port_of_loading = cleanPortOfLoading(separated.port_of_loading);
+  }
+
+  // Cross-verify Vessel from rawText ground truth
+  if (vessel_name) {
+    vessel_name = extractCompleteVesselName(vessel_name, rawText);
+  }
+  // Ensure the entire value under "VESSEL AND VOYAGE NUMBER" is preserved
+  if (voyage && vessel_name && !vessel_name.toUpperCase().includes(voyage.toUpperCase())) {
+    vessel_name = `${vessel_name} ${voyage}`.trim();
+  }
 
   // 10. Date on BL
   let bl_date: string | null = null;
@@ -266,6 +280,7 @@ export function parseBlText(rawText: string): ExtractedBLResult {
     container_size,
     bl_number,
     vessel_name,
+    voyage,
     port_of_loading,
     port_of_discharge,
     shipper,
@@ -325,5 +340,550 @@ export function sanitizeAndVerifyBlData(
     blData.container_numbers = Array.from(new Set(cleaned));
   }
 
+  // Strictly preserve complete Vessel value and separate Port of Loading
+  const separated = splitVesselVoyagePol(blData.vessel_name, blData.port_of_loading);
+  if (separated.vessel) blData.vessel_name = separated.vessel;
+  if (!blData.voyage && separated.voyage) blData.voyage = separated.voyage;
+  if (!blData.port_of_loading && separated.port_of_loading) blData.port_of_loading = separated.port_of_loading;
+
+  if (blData.vessel_name || rawPdfText) {
+    const verifiedVessel = extractCompleteVesselName(blData.vessel_name, rawPdfText);
+    if (verifiedVessel) {
+      blData.vessel_name = verifiedVessel;
+    }
+  }
+
+  if ((!blData.voyage || blData.voyage.trim() === '') && rawPdfText) {
+    const verifiedVoyage = extractVoyage(null, rawPdfText, blData.vessel_name);
+    if (verifiedVoyage) {
+      blData.voyage = verifiedVoyage;
+    }
+  }
+
+  // Ensure vessel_name contains the full voyage if voyage exists
+  if (blData.voyage && blData.vessel_name && !blData.vessel_name.toUpperCase().includes(blData.voyage.toUpperCase())) {
+    blData.vessel_name = `${blData.vessel_name} ${blData.voyage}`.trim();
+  }
+
+  if (blData.port_of_loading || rawPdfText) {
+    const verifiedPol = extractPortOfLoading(blData.port_of_loading, rawPdfText);
+    if (verifiedPol) {
+      blData.port_of_loading = verifiedPol;
+    }
+  }
+
+  if (rawPdfText && !blData.raw_text) {
+    blData.raw_text = rawPdfText;
+  }
+
   return blData;
+}
+
+/**
+ * Known field labels that delimit the boundary of the vessel/voyage section in a Bill of Lading.
+ */
+const VESSEL_DELIMITER_PATTERNS: RegExp[] = [
+  /\bPORT\s+OF\s+LOADING\b/i,
+  /\bPOL\b/i,
+  /\bPORT\s+OF\s+DISCHARGE\b/i,
+  /\bPOD\b/i,
+  /\bPLACE\s+OF\s+RECEIPT\b/i,
+  /\bPOR\b/i,
+  /\bPLACE\s+OF\s+DELIVERY\b/i,
+  /\bFINAL\s+DESTINATION\b/i,
+  /\bPOINT\s+(?:AND|&)\s+COUNTRY\b/i,
+  /\bFLAG\b/i,
+  /\bNATIONALITY\b/i,
+  /\bDATE\s+OF\s+ISSUE\b/i,
+  /\bSHIPPED\s+ON\s+BOARD\b/i,
+  /\bDATED\s+AT\b/i,
+  /\bBILL\s+OF\s+LADING\b/i,
+  /\bB\/?L\s*(?:NO|NUMBER)\b/i,
+  /\bBOOKING\s*(?:NO|NUMBER)\b/i,
+  /\bCONTAINER\s*(?:NO|NUMBER)\b/i,
+  /\bSHIPPER\b/i,
+  /\bCONSIGNEE\b/i,
+  /\bNOTIFY\s*PARTY\b/i,
+  /\bPARTICULARS\s+FURNISHED\b/i,
+  /\bFREIGHT\s+PAYABLE\b/i,
+  /\bEXPORT\s+CARRIER\b/i,
+  /\bPRE-?CARRIAGE\b/i,
+];
+
+/**
+ * Cleans the vessel value so it contains ONLY the vessel/ship name.
+ * Strictly removes any voyage codes, slashes, or Port of Loading that may have been appended.
+ * Preserves the complete vessel name without truncation.
+ */
+export function cleanVesselValue(str?: string | null): string {
+  if (!str) return '';
+  const parsed = splitVesselVoyagePol(str);
+  return parsed.vessel || str
+    .replace(/^(?:(?:OCEAN|FEEDER|EXPORT)\s+)?(?:VESSEL(?:\s+NAME)?|SHIP(?:\s+NAME)?)\s*[:.-]?\s*/i, '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/^[:.-]+\s*/, '')
+    .replace(/[/\s,.-]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Cleans the voyage value so it contains ONLY the voyage/reference code.
+ * Strictly removes labels like "VOYAGE", "VOY", "V.", slashes, and whitespace.
+ */
+export function cleanVoyageValue(str?: string | null): string {
+  if (!str) return '';
+  return str
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/^(?:VOYAGE(?:\s*(?:NO|NUMBER|#))?|VOY(?:\.|\b)(?:\s*(?:NO|NUMBER|#))?|V\.)\s*[:.-]?\s*/i, '')
+    .replace(/^[/\s:.-]+/, '')
+    .replace(/[/\s:.-]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Cleans the Port of Loading value.
+ * Preserves the complete location exactly as shown, including city/state/country where present.
+ * Strictly removes field labels.
+ */
+export function cleanPortOfLoading(str?: string | null): string {
+  if (!str) return '';
+  return str
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/^(?:PORT\s+OF\s+LOADING|POL\b|LOADING\s+PORT)\s*[:.-]?\s*/i, '')
+    .replace(/^[:.-]+\s*/, '')
+    .replace(/[/\s,.-]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Intelligently separates combined or same-line Vessel, Voyage, and Port of Loading strings.
+ * CRITICAL REQUIREMENTS:
+ * - The entire value appearing under "VESSEL AND VOYAGE NUMBER" must be preserved as the Vessel value.
+ * - Do NOT remove the voyage number (e.g. "632E") from the Vessel value.
+ * - Port of Loading must remain completely separate (e.g. "NEWARK, NJ").
+ * - Port of Loading must NEVER be merged into the Vessel field.
+ *
+ * Example:
+ * "MAERSK DENVER 632E NEWARK, NJ" ->
+ * vessel: "MAERSK DENVER 632E", voyage: "632E", port_of_loading: "NEWARK, NJ"
+ */
+export function splitVesselVoyagePol(
+  input?: string | null,
+  existingPol?: string | null
+): { vessel: string; voyage: string; port_of_loading: string } {
+  if (!input) {
+    return {
+      vessel: '',
+      voyage: '',
+      port_of_loading: cleanPortOfLoading(existingPol),
+    };
+  }
+
+  let raw = input.replace(/\r\n/g, '\n').trim();
+  let vessel = '';
+  let voyage = '';
+  let pol = cleanPortOfLoading(existingPol);
+
+  // Strip combined table headers like "VESSEL / VOYAGE / PORT OF LOADING:"
+  raw = raw.replace(
+    /^(?:(?:OCEAN|FEEDER|EXPORT)\s+)?VESSEL(?:\s+NAME)?(?:\s*(?:\/|\s*AND\s*|\s*&\s*)\s*(?:VOYAGE|VOY(?:\.|\b)|FLIGHT)?(?:\s*(?:NO|NUMBER|ID)\.?)?)?\s*[:.-]?\s*/i,
+    ''
+  );
+
+  // 1. Explicit Port of Loading label
+  const polLabelMatch = raw.match(/\b(?:PORT\s+OF\s+LOADING|POL\b|LOADING\s+PORT)\s*[:.-]\s*([\s\S]+)$/i);
+  if (polLabelMatch) {
+    if (!pol) pol = cleanPortOfLoading(polLabelMatch[1]);
+    raw = raw.slice(0, polLabelMatch.index).trim();
+  }
+
+  // 2. Explicit Voyage label
+  const voyLabelMatch = raw.match(
+    /\b(?:VOYAGE(?:\s*(?:NO|NUMBER|#))?|VOY(?:\.|\b)(?:\s*(?:NO|NUMBER|#))?|V\.)\s*[:.-]?\s*([A-Za-z0-9._-]+)([\s\S]*)$/i
+  );
+  if (voyLabelMatch) {
+    voyage = voyLabelMatch[1].trim();
+    const remaining = voyLabelMatch[2].trim();
+    const beforeVoy = raw.slice(0, voyLabelMatch.index).trim();
+    if (!pol && remaining) {
+      pol = cleanPortOfLoading(remaining.replace(/^[/\s,.-]+/, ''));
+    }
+    vessel = beforeVoy ? `${beforeVoy} ${voyage}`.trim() : voyage;
+    return buildCleanResult(vessel, voyage, pol);
+  }
+
+  // 3. Slash separated: e.g. "CMA CGM CONGO / 0INN0E1MA" or "CMA CGM CONGO / 0INN0E1MA / SAVANNAH, GA"
+  if (raw.includes('/')) {
+    const slashParts = raw.split('/').map((p) => p.trim()).filter(Boolean);
+    if (slashParts.length >= 2) {
+      if (!pol && (slashParts.length >= 3 || /(?:,\s*[A-Z]{2}\b|PORT|POL)/i.test(slashParts[slashParts.length - 1]))) {
+        pol = cleanPortOfLoading(slashParts[slashParts.length - 1]);
+        slashParts.pop();
+      }
+      vessel = slashParts.join(' / ');
+      const lastToken = slashParts[slashParts.length - 1];
+      const voyMatch = lastToken.match(/^([A-Za-z0-9._-]+)$/);
+      if (voyMatch) voyage = voyMatch[1];
+      return buildCleanResult(vessel, voyage, pol);
+    }
+  }
+
+  // 4. Multiline input
+  const lines = raw.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.length > 1) {
+    if (!pol && /(?:,\s*[A-Z]{2}\b|,\s*[A-Za-z]+|\bPORT\b)/i.test(lines[lines.length - 1])) {
+      pol = cleanPortOfLoading(lines.pop()!);
+    }
+    if (lines.length >= 2 && (/^[0-9]+[A-Za-z0-9_-]*$/.test(lines[lines.length - 1]) || /^(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{2,10}$/.test(lines[lines.length - 1]))) {
+      voyage = lines[lines.length - 1];
+      vessel = lines.join(' ');
+      return buildCleanResult(vessel, voyage, pol);
+    } else {
+      vessel = lines.join(' ');
+      return buildCleanResult(vessel, voyage, pol);
+    }
+  }
+
+  // 5. If POL is already known and matches the tail of raw, strip it first
+  if (pol) {
+    const polUpper = pol.toUpperCase();
+    const rawUpper = raw.toUpperCase();
+    const polIdx = rawUpper.lastIndexOf(polUpper);
+    if (polIdx > 0) {
+      raw = raw.slice(0, polIdx).replace(/^[/\s,.-]+|[/\s,.-]+$/g, '').trim();
+    }
+  }
+
+  // 6. Check for location pattern at the end: e.g. "NEWARK, NJ" or "ROTTERDAM, NETHERLANDS"
+  const locMatch = raw.match(/,\s*[A-Za-z]{2,}(?:\s+[A-Za-z]+)*$/i);
+  if (locMatch && !pol) {
+    const commaPos = locMatch.index!;
+    const beforeComma = raw.slice(0, commaPos).trim();
+    const cityMatch = beforeComma.match(/(?:\s+|^)([A-Za-z.\s'-]+)$/);
+    if (cityMatch) {
+      const city = cityMatch[1].trim();
+      const cityStart = beforeComma.lastIndexOf(city);
+      pol = cleanPortOfLoading(raw.slice(cityStart));
+      raw = raw.slice(0, cityStart).replace(/[/\s,.-]+$/, '').trim();
+    }
+  }
+
+  // 7. Find voyage pattern:
+  // Must contain digits (e.g. "632E", "0INN0E1MA", "0123-045W", "241A", "089W", "2501E", "022W")
+  const voyagePattern = /\b([0-9]+[A-Za-z0-9_-]*[A-Za-z]+[0-9A-Za-z_-]*|[0-9]{3,7}(?:-[0-9A-Za-z]+)?|[A-Za-z]+[0-9]{2,}[A-Za-z0-9_-]*|[0-9]{1,4}[NSEW])\b/g;
+  const matches: Array<{ token: string; index: number }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = voyagePattern.exec(raw)) !== null) {
+    const tok = m[1].toUpperCase();
+    if (!['40HC', '20GP', '40GP', '45HC', 'KGS', 'LBS'].includes(tok)) {
+      matches.push({ token: m[1], index: m.index });
+    }
+  }
+
+  if (matches.length > 0) {
+    const voy = matches[0];
+    voyage = voy.token;
+    const after = raw.slice(voy.index + voy.token.length).trim();
+    if (!pol && after) {
+      pol = cleanPortOfLoading(after);
+    }
+    // CRITICAL: Vessel MUST preserve the entire value including voyage number
+    vessel = raw.slice(0, voy.index + voy.token.length).trim();
+    return buildCleanResult(vessel, voyage, pol);
+  }
+
+  vessel = raw;
+  return buildCleanResult(vessel, voyage, pol);
+}
+
+function buildCleanResult(
+  v: string,
+  voy: string,
+  pol: string
+): { vessel: string; voyage: string; port_of_loading: string } {
+  let cleanVessel = (v || '')
+    .replace(/^(?:(?:OCEAN|FEEDER|EXPORT)\s+)?(?:VESSEL(?:\s+NAME)?|SHIP(?:\s+NAME)?)(?:\s*(?:\/|\s*AND\s*|\s*&\s*)\s*(?:VOYAGE|VOY(?:\.|\b)|FLIGHT)?(?:\s*(?:NO|NUMBER|ID)\.?)?)?\s*[:.-]?\s*/i, '')
+    .replace(/^[:.-]+/, '')
+    .replace(/[/\s,.-]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const cleanPol = cleanPortOfLoading(pol);
+
+  if (cleanPol && cleanVessel.toLowerCase().includes(cleanPol.toLowerCase())) {
+    cleanVessel = cleanVessel
+      .replace(new RegExp(`(?:\\s*[/,-]?\\s*)?\\b${cleanPol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi'), '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+  }
+
+  const cleanVoy = cleanVoyageValue(voy);
+
+  return { vessel: cleanVessel, voyage: cleanVoy, port_of_loading: cleanPol };
+}
+
+/**
+ * Extracts raw vessel line or block from text.
+ */
+export function extractRawVesselFromText(rawText: string): string | null {
+  if (!rawText) return null;
+  const labelRegex = /(?:(?:OCEAN|FEEDER|EXPORT)\s+)?VESSEL(?:\s+NAME)?\s*(?:(?:\/|\s*AND\s*|\s*&\s*)?\s*(?:VOYAGE|VOY(?:\.|\b)|FLIGHT)?(?:\s*(?:NO|NUMBER|ID)\.?)?)?\s*[:.-]?\s*/gi;
+  let match: RegExpExecArray | null;
+  while ((match = labelRegex.exec(rawText)) !== null) {
+    const matchEnd = match.index + match[0].length;
+    const windowText = rawText.slice(matchEnd, matchEnd + 150);
+
+    let endIdx = windowText.length;
+    for (const delim of VESSEL_DELIMITER_PATTERNS) {
+      const dm = windowText.match(delim);
+      if (dm && typeof dm.index === 'number' && dm.index < endIdx) {
+        endIdx = dm.index;
+      }
+    }
+
+    const lines = windowText.slice(0, endIdx).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    if (lines.length > 0) {
+      if (lines.length >= 2) {
+        const line1 = lines[1];
+        if (!/(?:,\s*[A-Z]{2}\b|PORT|POL|POD)/i.test(line1) && (/^[0-9]+[A-Za-z0-9_-]*$/.test(line1) || /^(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{2,10}$/.test(line1) || /^VOY/i.test(line1))) {
+          return `${lines[0]} ${line1}`.trim();
+        }
+      }
+      return lines[0];
+    }
+  }
+  return null;
+}
+
+/**
+ * Extracts raw voyage candidate from text.
+ */
+export function extractRawVoyageFromText(rawText: string): string | null {
+  if (!rawText) return null;
+  const voyMatch = rawText.match(
+    /\b(?:VOYAGE(?:\s*(?:NO|NUMBER|#))?|VOY(?:\.|\b)(?:\s*(?:NO|NUMBER|#))?|V\.)\s*[:.-]?\s*([A-Za-z0-9._-]+)/i
+  );
+  if (voyMatch) return voyMatch[1].trim();
+  return null;
+}
+
+/**
+ * Extracts the complete, verified vessel name from raw text or candidate.
+ * Adheres strictly to the rules:
+ * - Vessel must contain ONLY the vessel/ship name.
+ * - NEVER append Port of Loading to the Vessel field.
+ * - NEVER append Voyage or Port of Loading to Vessel.
+ * - Preserve the complete vessel name without truncation.
+ */
+export function extractCompleteVesselName(
+  candidateVessel?: string | null,
+  rawText?: string
+): string | null {
+  const separatedCand = splitVesselVoyagePol(candidateVessel);
+  const cleanCandidate = separatedCand.vessel;
+
+  // 1. If we have a candidate and raw text, check if candidate was truncated in the text
+  // (e.g., candidate is "MAERSK" while BL text has "MAERSK DENVER")
+  if (cleanCandidate && rawText) {
+    const rawUpper = rawText.toUpperCase();
+    const candUpper = cleanCandidate.toUpperCase();
+
+    let searchPos = 0;
+    while (searchPos < rawUpper.length) {
+      const idx = rawUpper.indexOf(candUpper, searchPos);
+      if (idx === -1) break;
+
+      const afterPos = idx + cleanCandidate.length;
+      const tail = rawText.slice(afterPos, afterPos + 120);
+
+      // Stop before delimiters, voyage, or POL
+      let earliestDelimIdx = tail.length;
+      for (const delim of VESSEL_DELIMITER_PATTERNS) {
+        const m = tail.match(delim);
+        if (m && typeof m.index === 'number' && m.index < earliestDelimIdx) {
+          earliestDelimIdx = m.index;
+        }
+      }
+
+      // Check if candidate extends further without crossing into voyage/POL
+      const windowStr = rawText.slice(idx, afterPos + earliestDelimIdx);
+      const splitWindow = splitVesselVoyagePol(windowStr);
+      if (splitWindow.vessel && splitWindow.vessel.length > cleanCandidate.length) {
+        return splitWindow.vessel;
+      }
+
+      searchPos = idx + 1;
+    }
+  }
+
+  // 2. Direct extraction from rawText if no candidate
+  if (!cleanCandidate && rawText) {
+    const rawVessel = extractRawVesselFromText(rawText);
+    if (rawVessel) {
+      const splitVes = splitVesselVoyagePol(rawVessel);
+      if (splitVes.vessel && splitVes.vessel.length >= 3) {
+        return splitVes.vessel;
+      }
+    }
+  }
+
+  return cleanCandidate || null;
+}
+
+/**
+ * Extracts Voyage/reference code strictly separately.
+ * Voyage must contain ONLY the voyage/reference value.
+ */
+export function extractVoyage(
+  candidateVoyage?: string | null,
+  rawText?: string,
+  vesselName?: string | null
+): string | null {
+  if (candidateVoyage) {
+    const cleaned = cleanVoyageValue(candidateVoyage);
+    if (cleaned) return cleaned;
+  }
+
+  if (rawText) {
+    const rawVoy = extractRawVoyageFromText(rawText);
+    if (rawVoy) return cleanVoyageValue(rawVoy);
+
+    // If vessel is known, check text immediately following vessel
+    if (vesselName) {
+      const vUpper = vesselName.toUpperCase();
+      const rUpper = rawText.toUpperCase();
+      const pos = rUpper.indexOf(vUpper);
+      if (pos !== -1) {
+        const tail = rawText.slice(pos + vesselName.length, pos + vesselName.length + 80);
+        const split = splitVesselVoyagePol(tail);
+        if (split.voyage) return split.voyage;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extracts Port of Loading strictly separately.
+ * Port of Loading must contain ONLY the loading port/location.
+ */
+export function extractPortOfLoading(
+  candidatePol?: string | null,
+  rawText?: string
+): string | null {
+  if (candidatePol) {
+    const cleaned = cleanPortOfLoading(candidatePol);
+    if (cleaned) return cleaned;
+  }
+
+  if (rawText) {
+    const polMatch = rawText.match(
+      /(?:PORT\s+OF\s+LOADING|POL\b|LOADING\s+PORT)\s*[:.-]?\s*([A-Z\s,.-]{2,50}?)(?:\s*(?:PORT\s+OF\s+DISCHARGE|POD\b|FINAL\s+DESTINATION|VESSEL|VOYAGE|DATE|PLACE\s+OF|\n|$))/i
+    );
+    if (polMatch) {
+      return cleanPortOfLoading(polMatch[1]);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Selects the complete, non-truncated vessel name between two candidates (e.g. AI extraction vs local regex),
+ * cross-verifying with the raw BL text ground truth.
+ * Strictly guarantees that NEITHER Voyage NOR Port of Loading is merged into the vessel name.
+ */
+export function selectCompleteVesselName(
+  candidateA: string | null | undefined,
+  candidateB: string | null | undefined,
+  rawText?: string
+): string | null {
+  const a = cleanVesselValue(candidateA);
+  const b = cleanVesselValue(candidateB);
+
+  let chosen = a;
+  if (!a && b) {
+    chosen = b;
+  } else if (a && b) {
+    if (b.length > a.length && b.toUpperCase().includes(a.toUpperCase())) {
+      chosen = b;
+    } else if (a.length > b.length && a.toUpperCase().includes(b.toUpperCase())) {
+      chosen = a;
+    }
+  }
+
+  if (rawText) {
+    const verified = extractCompleteVesselName(chosen, rawText);
+    if (verified && verified.length >= chosen.length) {
+      return verified;
+    }
+  }
+
+  return chosen || null;
+}
+
+/**
+ * Validates that the full verified vessel value contains ONLY the complete vessel name.
+ * Strictly strips any Voyage or Port of Loading that may have been glued to the value.
+ */
+export function validateFullVesselValue(
+  vessel: string | null | undefined,
+  rawText?: string
+): string {
+  const current = cleanVesselValue(vessel);
+  if (!current) {
+    if (rawText) {
+      const extracted = extractCompleteVesselName(null, rawText);
+      if (extracted) return cleanVesselValue(extracted);
+    }
+    return '';
+  }
+
+  if (rawText) {
+    const verified = extractCompleteVesselName(current, rawText);
+    if (verified && verified.length >= current.length) {
+      return cleanVesselValue(verified);
+    }
+  }
+
+  return current;
+}
+
+/**
+ * Validates Vessel, Voyage, and Port of Loading together to ensure strict separation.
+ */
+export function validateVesselVoyagePol(
+  vessel?: string | null,
+  voyage?: string | null,
+  pol?: string | null,
+  rawText?: string
+): { vessel: string; voyage: string; port_of_loading: string } {
+  const splitVes = splitVesselVoyagePol(vessel, pol);
+
+  let finalVessel = validateFullVesselValue(splitVes.vessel, rawText);
+  let finalVoyage = cleanVoyageValue(voyage || splitVes.voyage);
+  let finalPol = cleanPortOfLoading(pol || splitVes.port_of_loading);
+
+  if (!finalVoyage && rawText) {
+    finalVoyage = extractVoyage(null, rawText, finalVessel) || '';
+  }
+  if (!finalPol && rawText) {
+    finalPol = extractPortOfLoading(null, rawText) || '';
+  }
+
+  // CRITICAL REQUIREMENT:
+  // The entire value appearing under "VESSEL AND VOYAGE NUMBER" must be preserved as the Vessel value.
+  if (finalVoyage && finalVessel && !finalVessel.toUpperCase().includes(finalVoyage.toUpperCase())) {
+    finalVessel = `${finalVessel} ${finalVoyage}`.trim();
+  }
+
+  return {
+    vessel: finalVessel,
+    voyage: finalVoyage,
+    port_of_loading: finalPol,
+  };
 }

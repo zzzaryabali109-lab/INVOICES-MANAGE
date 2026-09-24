@@ -19,6 +19,7 @@ import {
   normalizeDecimalForMath,
   multiplyDecimalStrings,
   formatCalculatedDecimal,
+  stripTrailingZeros,
   normalizeDateString,
   todayDDMMYY,
 } from '@/pages/InvoiceGenerator';
@@ -27,6 +28,11 @@ import {
   extractRawTextFromPdf,
   parseBlText,
   sanitizeAndVerifyBlData,
+  selectCompleteVesselName,
+  validateFullVesselValue,
+  splitVesselVoyagePol,
+  cleanVoyageValue,
+  cleanPortOfLoading,
 } from '@/lib/pdfBlExtractor';
 import { compressBlPdf, compressBlFile } from '@/lib/pdfCompressor';
 
@@ -176,14 +182,27 @@ function normalizeExtractedBlData(raw: any, rawPdfText?: string) {
   const finalDescription = composed.lines.length > 0 && composed.text ? composed.text : cleanedDescription;
   const finalHsCode = composed.lines.length > 0 ? (raw?.hs_code || '') : (raw?.hs_code || composed.primaryHs || '');
 
+  const separated = splitVesselVoyagePol(raw?.vessel_name, raw?.port_of_loading);
+  let validatedVessel = validateFullVesselValue(separated.vessel, rawPdfText || raw?.raw_text);
+  const validatedVoyage = cleanVoyageValue(raw?.voyage || separated.voyage);
+  const validatedPol = cleanPortOfLoading(raw?.port_of_loading || separated.port_of_loading);
+
+  if (validatedVoyage && validatedVessel && !validatedVessel.toUpperCase().includes(validatedVoyage.toUpperCase())) {
+    validatedVessel = `${validatedVessel} ${validatedVoyage}`.trim();
+  }
+
   return {
     ...raw,
+    vessel_name: validatedVessel,
+    voyage: validatedVoyage,
+    port_of_loading: validatedPol,
     container_numbers: cleanContainerList(raw?.container_numbers),
     notify_party: mergedNotify,
     notify_party_address: '',
     description: finalDescription,
     hs_code: finalHsCode,
     goods_lines: composed.lines,
+    raw_text: rawPdfText || raw?.raw_text,
   };
 }
 
@@ -210,7 +229,7 @@ function singleBlCalculate(blData: any, companyPriceStr: string) {
 
   return {
     unitPrice: unitPriceNum,
-    unitPriceText,
+    unitPriceText: stripTrailingZeros(unitPriceText),
     totalPriceText,
     kgs: blData.kgs as number,
   };
@@ -343,6 +362,11 @@ export function BulkBlUpload({ excelRows, templateFile, templateLayout }: BulkBl
 
       // Merge and verify against document ground truth
       if (localExtracted && rawData) {
+        const fullVessel = selectCompleteVesselName(
+          rawData.vessel_name,
+          localExtracted.vessel_name,
+          rawPdfText || rawData.raw_text
+        );
         rawData = {
           ...localExtracted,
           ...rawData,
@@ -355,10 +379,15 @@ export function BulkBlUpload({ excelRows, templateFile, templateLayout }: BulkBl
             ]),
           ),
           bl_number: rawData.bl_number || localExtracted.bl_number,
-          vessel_name: rawData.vessel_name || localExtracted.vessel_name,
+          vessel_name: fullVessel || rawData.vessel_name || localExtracted.vessel_name,
+          voyage: rawData.voyage || localExtracted.voyage,
+          port_of_loading: rawData.port_of_loading || localExtracted.port_of_loading,
+          port_of_discharge: rawData.port_of_discharge || localExtracted.port_of_discharge,
+          raw_text: rawPdfText || rawData.raw_text || localExtracted.raw_text,
         };
         rawData = sanitizeAndVerifyBlData(rawData, rawPdfText);
       } else if (rawPdfText && rawData) {
+        rawData.raw_text = rawPdfText || rawData.raw_text;
         rawData = sanitizeAndVerifyBlData(rawData, rawPdfText);
       }
 
@@ -439,6 +468,15 @@ export function BulkBlUpload({ excelRows, templateFile, templateLayout }: BulkBl
       const containerSize = blData?.container_size || '';
       const bales = blData?.bales || '';
 
+      // Validate that the complete extracted Vessel value is passed to Adobe PDF mapping
+      let fullVerifiedVessel = validateFullVesselValue(
+        blData?.vessel_name,
+        (blData as any)?.raw_text
+      );
+      if (blData?.voyage && fullVerifiedVessel && !fullVerifiedVessel.toUpperCase().includes(blData.voyage.toUpperCase())) {
+        fullVerifiedVessel = `${fullVerifiedVessel} ${blData.voyage}`.trim();
+      }
+
       const adobeData = {
         invoice_number: invNum,
         date: invoiceDate,
@@ -451,7 +489,8 @@ export function BulkBlUpload({ excelRows, templateFile, templateLayout }: BulkBl
         container_size: containerSize,
         container_numbers: containerNums,
         container_numbers_one: firstContainer,
-        vessel: blData?.vessel_name || '',
+        vessel: fullVerifiedVessel || blData?.vessel_name || '',
+        voyage: blData?.voyage || '',
         port_of_loading: blData?.port_of_loading || '',
         port_of_discharge: blData?.port_of_discharge || '',
         hs_code: blData?.hs_code || '',
@@ -462,11 +501,11 @@ export function BulkBlUpload({ excelRows, templateFile, templateLayout }: BulkBl
             (blData as any)?.goods_lines?.[i]?.text || '',
           ]),
         ),
-        gross_weight: `${calc.kgs}KGS`,
-        unit_price: `${calc.unitPriceText}US$ Per KG`,
-        amount: `${calc.totalPriceText}$`,
+        gross_weight: `${stripTrailingZeros(calc.kgs)}KGS`,
+        unit_price: `${stripTrailingZeros(calc.unitPriceText)}US$ Per KG`,
+        amount: `${stripTrailingZeros(calc.totalPriceText)}$`,
         shipping_marks: blData?.shipping_marks || 'NIL',
-        packages: bales ? `${bales} BALES` : (blData?.packages || ''),
+        packages: bales ? `${stripTrailingZeros(bales)} BALES` : (blData?.packages || ''),
         company_name: blData?.shipper || '',
       };
 
@@ -1297,7 +1336,7 @@ function FileDetailsPanel({
             <p className="text-sm font-bold text-foreground">Invoice Information</p>
             {[
               ['Invoice #', item.invoiceNumber],
-              ['Company Price', item.companyPrice ? `$${item.companyPrice}` : null],
+              ['Company Price', item.companyPrice ? `$${stripTrailingZeros(item.companyPrice)}` : null],
               ['Container', item.containerNumber],
               ['BL #', item.blNumber],
             ].filter(([, v]) => !!v).map(([k, v]) => (

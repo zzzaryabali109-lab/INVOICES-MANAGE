@@ -123,8 +123,19 @@ const detectDecimals = (rawWeightText?: string | null, kgs?: number | null): num
   return 4;
 };
 
-const formatWeight = (value: number, decimals: number): string =>
-  decimals > 0 ? value.toFixed(decimals) : String(Math.round(value));
+export const stripTrailingZeros = (value: string | number | null | undefined): string => {
+  if (value === null || value === undefined || value === '') return '';
+  const str = String(value).trim();
+  if (!str.includes('.')) return str;
+  return str
+    .replace(/(\.\d*?[1-9])0+(?=[^\d]|$)/g, '$1')
+    .replace(/\.0+(?=[^\d]|$)/g, '');
+};
+
+const formatWeight = (value: number, decimals: number): string => {
+  const formatted = decimals > 0 ? value.toFixed(decimals) : String(Math.round(value));
+  return stripTrailingZeros(formatted);
+};
 
 const buildLine = (hs: string | null, name: string, weightText: string): GoodsLine => ({
   hs,

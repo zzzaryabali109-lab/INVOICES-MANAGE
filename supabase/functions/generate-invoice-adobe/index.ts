@@ -160,6 +160,36 @@ Deno.serve(async (req) => {
     const payload = await req.json().catch(() => ({}));
     const data = payload?.data ?? {};
 
+    const stripNumericTrailingZeros = (val: string): string => {
+      if (!val || !val.includes('.')) return val;
+      return val
+        .replace(/(\.\d*?[1-9])0+(?=[^\d]|$)/g, '$1')
+        .replace(/\.0+(?=[^\d]|$)/g, '');
+    };
+
+    // Strict separation: ensure vessel does not contain voyage or port_of_loading
+    let cleanVessel = String(data.vessel ?? '').trim();
+    let cleanVoy = String(data.voyage ?? '').trim();
+    let cleanPol = String(data.port_of_loading ?? '').trim();
+
+    const slashMatch = cleanVessel.match(/^([^/]+?)\s*[/]\s*([A-Z0-9-]{2,15})(?:\s+(.*))?$/i);
+    if (slashMatch) {
+      cleanVessel = slashMatch[1].trim();
+      if (!cleanVoy) cleanVoy = slashMatch[2].trim();
+      if (!cleanPol && slashMatch[3]) cleanPol = slashMatch[3].trim();
+    } else {
+      const voyMatch = cleanVessel.match(/^([A-Z\s.-]+?)\s+([0-9]{2,5}[A-Z]{0,4}|[0-9]{1,4}[A-Z]|[A-Z]{1,3}\d{2,6}[A-Z]?)(?:\s+(.*))?$/i);
+      if (voyMatch && voyMatch[1].length >= 3) {
+        cleanVessel = voyMatch[1].trim();
+        if (!cleanVoy) cleanVoy = voyMatch[2].trim();
+        if (!cleanPol && voyMatch[3]) cleanPol = voyMatch[3].trim();
+      }
+    }
+
+    if (cleanPol && cleanVessel.toLowerCase().includes(cleanPol.toLowerCase())) {
+      cleanVessel = cleanVessel.replace(new RegExp(`\\b${cleanPol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi'), '').replace(/\s{2,}/g, ' ').trim();
+    }
+
     // Normalize tag values to strings
     const baseTags: Record<string, string> = {
       invoice_number: String(data.invoice_number ?? ''),
@@ -173,8 +203,8 @@ Deno.serve(async (req) => {
       container_size: String(data.container_size ?? ''),
       container_numbers: String(data.container_numbers ?? ''),
       container_numbers_one: String(data.container_numbers_one ?? data.container_numbers ?? ''),
-      vessel: String(data.vessel ?? ''),
-      port_of_loading: String(data.port_of_loading ?? ''),
+      vessel: cleanVessel,
+      port_of_loading: cleanPol,
       port_of_discharge: String(data.port_of_discharge ?? ''),
       hs_code: String(data.hs_code ?? ''),
       goods_description: String(data.goods_description ?? ''),
@@ -186,17 +216,17 @@ Deno.serve(async (req) => {
       goods_description_6: String(data.goods_description_6 ?? ''),
       goods_description_7: String(data.goods_description_7 ?? ''),
       goods_description_8: String(data.goods_description_8 ?? ''),
-      gross_weight: String(data.gross_weight ?? ''),
-      unit_price: String(data.unit_price ?? ''),
-      amount: String(data.amount ?? ''),
+      gross_weight: stripNumericTrailingZeros(String(data.gross_weight ?? '')),
+      unit_price: stripNumericTrailingZeros(String(data.unit_price ?? '')),
+      amount: stripNumericTrailingZeros(String(data.amount ?? '')),
       shipping_marks: String(data.shipping_marks ?? ''),
-      packages: String(data.packages ?? ''),
+      packages: stripNumericTrailingZeros(String(data.packages ?? '')),
       company_name: String(data.company_name ?? ''),
       // Optional extras available from the BL (blank if not extracted)
       bl_number: String(data.bl_number ?? ''),
       seal_number: String(data.seal_number ?? ''),
-      net_weight: String(data.net_weight ?? ''),
-      voyage: String(data.voyage ?? ''),
+      net_weight: stripNumericTrailingZeros(String(data.net_weight ?? '')),
+      voyage: cleanVoy,
       place_of_receipt: String(data.place_of_receipt ?? ''),
       final_destination: String(data.final_destination ?? ''),
 

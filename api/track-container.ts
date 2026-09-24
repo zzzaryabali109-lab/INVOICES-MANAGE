@@ -1,8 +1,3 @@
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
-
 const TIMETOCARGO_DEFAULT_KEY = '6F91A193-A839-43F7-B502-187AAC5834AB';
 const TRAQO_DEFAULT_KEY = '55799d2f7c1b974351122243d097de5753752f77f5624ae080ecb45b2a95b101';
 
@@ -149,13 +144,13 @@ function parseTraqoResponse(containerNumber: string, json: any) {
   }
 
   const events: any[] = Array.isArray(data.events_table) ? data.events_table : [];
-  const actualEvents = events.filter((e: any) => e.is_actual === 1);
+  const actualEvents = events.filter((e) => e.is_actual === 1);
   const latestActual = actualEvents.length > 0 ? actualEvents[actualEvents.length - 1] : events[0];
 
   const vessels: any[] = Array.isArray(data.vessels_table) ? data.vessels_table : [];
-  const currentVessel = vessels.find((v: any) => v.is_current === 1) || vessels[0];
+  const currentVessel = vessels.find((v) => v.is_current === 1) || vessels[0];
 
-  const voyage = latestActual?.voyage || events.slice().reverse().find((e: any) => e.voyage)?.voyage || '';
+  const voyage = latestActual?.voyage || events.slice().reverse().find((e) => e.voyage)?.voyage || '';
 
   let location = '';
   if (latestActual?.location) {
@@ -196,31 +191,41 @@ function parseTraqoResponse(containerNumber: string, json: any) {
   };
 }
 
-// @ts-ignore
-Deno.serve(async (req: Request) => {
+export default async function handler(req: any, res: any) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
   if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
+    return res.status(200).end();
   }
 
   try {
-    const body = await req.json().catch(() => ({}));
-    const rawNumber = body?.containerNumber;
-
-    if (!rawNumber) {
-      return new Response(
-        JSON.stringify({ success: false, error: 'Container number required' }), 
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+    let body = req.body;
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        body = {};
+      }
     }
 
-    const containerNumber = String(rawNumber).trim().toUpperCase();
-    const userSealine = (body?.sealine || '').trim().toUpperCase();
-    const sealine = userSealine || inferSealine(containerNumber);
+    const rawNumber = body?.containerNumber || req.query?.containerNumber;
+    if (!rawNumber || typeof rawNumber !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Container number is required',
+      });
+    }
 
-    // 1. Primary: TimeToCargo API
+    const containerNumber = rawNumber.trim().toUpperCase();
+    const userSealine = (body?.sealine || (req.query?.sealine as string) || '').trim().toUpperCase();
+    const inferred = inferSealine(containerNumber);
+    const sealine = userSealine || inferred;
+
+    // 1. Primary: TimeToCargo API with key 6F91A193-A839-43F7-B502-187AAC5834AB
     try {
-      // @ts-ignore
-      const ttcApiKey = Deno.env.get('TIMETOCARGO_API_KEY') || TIMETOCARGO_DEFAULT_KEY;
+      const ttcApiKey = process.env.TIMETOCARGO_API_KEY || TIMETOCARGO_DEFAULT_KEY;
       const ttcCompany = sealine || 'AUTO';
       const ttcUrl = `https://tracking.timetocargo.com/v1/container?api_key=${encodeURIComponent(
         ttcApiKey
@@ -234,11 +239,11 @@ Deno.serve(async (req: Request) => {
       const ttcJson = await ttcRes.json().catch(() => null);
 
       if (ttcRes.ok && ttcJson?.success && ttcJson?.data) {
-        const trackingData = parseTimeToCargoResponse(containerNumber, ttcJson);
-        return new Response(
-          JSON.stringify({ success: true, data: trackingData }), 
-          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
+        const parsedData = parseTimeToCargoResponse(containerNumber, ttcJson);
+        return res.status(200).json({
+          success: true,
+          data: parsedData,
+        });
       }
 
       if (ttcCompany !== 'AUTO') {
@@ -251,80 +256,76 @@ Deno.serve(async (req: Request) => {
         });
         const autoJson = await autoRes.json().catch(() => null);
         if (autoRes.ok && autoJson?.success && autoJson?.data) {
-          const trackingData = parseTimeToCargoResponse(containerNumber, autoJson);
-          return new Response(
-            JSON.stringify({ success: true, data: trackingData }), 
-            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
+          const parsedData = parseTimeToCargoResponse(containerNumber, autoJson);
+          return res.status(200).json({
+            success: true,
+            data: parsedData,
+          });
         }
       }
     } catch {
-      // Continue to fallback
+      // Proceed to fallback
     }
 
-    // 2. Secondary: Traqo API
-    // @ts-ignore
-    const apiKey = Deno.env.get('TRAQO_API_KEY') || TRAQO_DEFAULT_KEY;
+    // 2. Secondary: Traqo API fallback
+    const apiKey = process.env.TRAQO_API_KEY || TRAQO_DEFAULT_KEY;
     const authHeader = apiKey.startsWith('Bearer ') ? apiKey : `Bearer ${apiKey}`;
 
-    const fetchTraqo = async (withSealine: boolean) => {
+    const fetchFromTraqo = async (withSealine: boolean) => {
       const query = withSealine && sealine ? `?sealine=${encodeURIComponent(sealine)}` : '';
       const url = `https://traqocontainer.com/api/v1/container/${encodeURIComponent(containerNumber)}${query}`;
-      const res = await fetch(url, {
+
+      const response = await fetch(url, {
         method: 'GET',
         headers: {
-          'Authorization': authHeader,
-          'Accept': 'application/json',
+          Authorization: authHeader,
+          Accept: 'application/json',
         },
       });
-      const json = await res.json().catch(() => null);
-      return { res, json };
+
+      const json = await response.json().catch(() => null);
+      return { response, json };
     };
 
-    let { res, json } = await fetchTraqo(Boolean(sealine));
+    let { response, json } = await fetchFromTraqo(Boolean(sealine));
 
-    if ((!res.ok || !json?.success) && sealine) {
-      const fallback = await fetchTraqo(false);
-      if (fallback.res.ok && fallback.json?.success) {
-        res = fallback.res;
+    if ((!response.ok || !json?.success) && sealine) {
+      const fallback = await fetchFromTraqo(false);
+      if (fallback.response.ok && fallback.json?.success) {
+        response = fallback.response;
         json = fallback.json;
       }
     }
 
-    if (!res.ok || !json?.success) {
+    if (!response.ok || !json?.success) {
       const errorMsg = json?.message || 'Container not found or tracking data unavailable';
-      return new Response(
-        JSON.stringify({ 
-          success: false, 
+      return res.status(200).json({
+        success: false,
+        error: errorMsg,
+        data: {
+          containerNumber,
+          shippingLine: sealine || '',
+          currentLocation: '',
+          vesselName: '',
+          voyageNumber: '',
+          eta: '',
+          lastUpdate: '',
+          status: 'Not Available',
+          destinationPort: '',
           error: errorMsg,
-          data: {
-            containerNumber,
-            shippingLine: sealine || '',
-            currentLocation: '',
-            vesselName: '',
-            voyageNumber: '',
-            eta: '',
-            lastUpdate: '',
-            status: 'Not Available',
-            destinationPort: '',
-            error: errorMsg,
-          }
-        }), 
-        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+        },
+      });
     }
 
-    const trackingData = parseTraqoResponse(containerNumber, json);
-    return new Response(
-      JSON.stringify({ success: true, data: trackingData }), 
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    const sanitizedError = error instanceof Error ? error.message : 'Unknown error';
-    console.error('Tracking error:', sanitizedError);
-    return new Response(
-      JSON.stringify({ success: false, error: 'Internal server error' }), 
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    const parsedData = parseTraqoResponse(containerNumber, json);
+    return res.status(200).json({
+      success: true,
+      data: parsedData,
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'Internal server error while tracking container',
+    });
   }
-});
+}

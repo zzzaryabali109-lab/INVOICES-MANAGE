@@ -7,10 +7,13 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Build & deployment artifacts
 node_modules
 dist
 dist-ssr
 *.local
+.netlify
+.vercel
 
 # Editor directories and files
 .vscode/*

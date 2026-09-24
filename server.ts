@@ -7,6 +7,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
+const TIMETOCARGO_DEFAULT_KEY = '6F91A193-A839-43F7-B502-187AAC5834AB';
 const TRAQO_DEFAULT_KEY = '55799d2f7c1b974351122243d097de5753752f77f5624ae080ecb45b2a95b101';
 
 // Prefix-to-sealine inference helper
@@ -106,6 +107,113 @@ function parseTraqoResponse(containerNumber: string, json: any) {
   };
 }
 
+// Map TimeToCargo API response to frontend ContainerData
+function parseTimeToCargoResponse(containerNumber: string, json: any) {
+  const data = json?.data;
+  if (!data) {
+    return {
+      containerNumber,
+      shippingLine: '',
+      currentLocation: '',
+      vesselName: '',
+      voyageNumber: '',
+      eta: '',
+      lastUpdate: '',
+      status: 'Not Available',
+      destinationPort: '',
+      error: json?.status_description || json?.message || 'No tracking data available',
+    };
+  }
+
+  // Locations lookup map
+  const locationsMap = new Map<number, string>();
+  if (Array.isArray(data.locations)) {
+    for (const loc of data.locations) {
+      if (typeof loc?.id === 'number') {
+        const parts = [loc.name, loc.country].filter(Boolean);
+        locationsMap.set(loc.id, parts.join(', '));
+      }
+    }
+  }
+
+  const events: any[] = Array.isArray(data.container?.events) ? data.container.events : [];
+  const latestEvent = events[0] || null;
+
+  // Find latest event with vessel information
+  const vesselEvent = events.find((e: any) => e.vessel) || null;
+  const vesselName = vesselEvent?.vessel || '';
+  const voyageNumber = vesselEvent?.voyage || '';
+
+  // Determine current location
+  let currentLocation = '';
+  if (latestEvent && typeof latestEvent.location === 'number') {
+    currentLocation = locationsMap.get(latestEvent.location) || '';
+  }
+
+  // Determine destination port
+  let destinationPort = '';
+  const podLocId = data.summary?.pod?.location ?? data.summary?.destination?.location;
+  if (typeof podLocId === 'number') {
+    destinationPort = locationsMap.get(podLocId) || '';
+  }
+
+  // Determine ETA
+  const rawEta = data.summary?.pod?.date || data.summary?.destination?.date || '';
+  const eta = rawEta ? String(rawEta).split('T')[0] : '';
+
+  // Determine last update
+  const rawLastUpdate = latestEvent?.date || data.tracking_metadata?.updated_at || '';
+  const lastUpdate = rawLastUpdate ? String(rawLastUpdate).replace('T', ' ').slice(0, 19) : '';
+
+  // Shipping line
+  const shippingLine =
+    data.summary?.company?.name ||
+    data.summary?.company?.full_name ||
+    '';
+
+  // Determine status
+  let status = 'In Transit';
+  const rawStatus = String(data.shipment_status || '').toUpperCase();
+  const latestStatus = String(latestEvent?.status || '').toLowerCase();
+
+  if (
+    rawStatus === 'DELIVERED' ||
+    latestStatus.includes('delivered') ||
+    latestStatus.includes('import to consignee') ||
+    latestStatus.includes('empty received')
+  ) {
+    status = 'Arrived';
+  } else if (rawStatus === 'DISCHARGED' || latestStatus.includes('discharged')) {
+    status = 'Discharged';
+  } else if (rawStatus === 'ARRIVED' || latestStatus.includes('arrival')) {
+    status = 'Arrived';
+  } else if (
+    rawStatus === 'LOADING' ||
+    rawStatus === 'LOADED' ||
+    latestStatus.includes('loaded') ||
+    latestStatus.includes('loading')
+  ) {
+    status = 'Loading';
+  } else if (rawStatus === 'PENDING' || latestStatus.includes('pending') || latestStatus.includes('booked')) {
+    status = 'Pending';
+  } else if (rawStatus === 'IN_TRANSIT' || rawStatus === 'TRANSSHIPMENT') {
+    status = 'In Transit';
+  }
+
+  return {
+    containerNumber: data.container?.number || containerNumber,
+    shippingLine,
+    currentLocation,
+    vesselName,
+    voyageNumber,
+    eta,
+    lastUpdate,
+    status,
+    destinationPort,
+    error: null,
+  };
+}
+
 async function startServer() {
   const app = express();
 
@@ -116,7 +224,7 @@ async function startServer() {
     res.json({ status: 'ok', service: 'container-tracking-backend' });
   });
 
-  // Traqo container tracking handler
+  // Container tracking handler supporting TimeToCargo & Traqo fallback
   const handleTrackContainer = async (req: Request, res: Response) => {
     try {
       const rawNumber = req.body?.containerNumber || req.query?.containerNumber;
@@ -128,13 +236,62 @@ async function startServer() {
       }
 
       const containerNumber = rawNumber.trim().toUpperCase();
-      const apiKey = process.env.TRAQO_API_KEY || TRAQO_DEFAULT_KEY;
-
-      const userSealine = (req.body?.sealine || req.query?.sealine as string || '').trim().toUpperCase();
+      const ttcApiKey = process.env.TIMETOCARGO_API_KEY || TIMETOCARGO_DEFAULT_KEY;
+      const userSealine = (req.body?.sealine || (req.query?.sealine as string) || '').trim().toUpperCase();
       const inferred = inferSealine(containerNumber);
       const sealine = userSealine || inferred;
 
-      const authHeader = apiKey.startsWith('Bearer ') ? apiKey : `Bearer ${apiKey}`;
+      // 1. Primary: TimeToCargo API with key 6F91A193-A839-43F7-B502-187AAC5834AB
+      try {
+        const ttcCompany = sealine || 'AUTO';
+        const ttcUrl = `https://tracking.timetocargo.com/v1/container?api_key=${encodeURIComponent(
+          ttcApiKey
+        )}&company=${encodeURIComponent(ttcCompany)}&container_number=${encodeURIComponent(containerNumber)}`;
+
+        console.log(`[TimeToCargo API] Fetching: ${ttcUrl.replace(ttcApiKey, 'REDACTED')}`);
+
+        const ttcRes = await fetch(ttcUrl, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+        });
+
+        const ttcJson = await ttcRes.json().catch(() => null);
+
+        if (ttcRes.ok && ttcJson?.success && ttcJson?.data) {
+          const parsedData = parseTimeToCargoResponse(containerNumber, ttcJson);
+          console.log(`[TimeToCargo API] Successfully tracked ${containerNumber} (${parsedData.status})`);
+          return res.status(200).json({
+            success: true,
+            data: parsedData,
+          });
+        }
+
+        // If company was specific and failed, retry with company=AUTO
+        if (ttcCompany !== 'AUTO') {
+          const autoUrl = `https://tracking.timetocargo.com/v1/container?api_key=${encodeURIComponent(
+            ttcApiKey
+          )}&company=AUTO&container_number=${encodeURIComponent(containerNumber)}`;
+          const autoRes = await fetch(autoUrl, {
+            method: 'GET',
+            headers: { Accept: 'application/json' },
+          });
+          const autoJson = await autoRes.json().catch(() => null);
+          if (autoRes.ok && autoJson?.success && autoJson?.data) {
+            const parsedData = parseTimeToCargoResponse(containerNumber, autoJson);
+            console.log(`[TimeToCargo API AUTO] Successfully tracked ${containerNumber} (${parsedData.status})`);
+            return res.status(200).json({
+              success: true,
+              data: parsedData,
+            });
+          }
+        }
+      } catch (ttcErr) {
+        console.warn('[TimeToCargo API] Error, trying fallback:', ttcErr);
+      }
+
+      // 2. Secondary: Traqo API fallback
+      const traqoApiKey = process.env.TRAQO_API_KEY || TRAQO_DEFAULT_KEY;
+      const authHeader = traqoApiKey.startsWith('Bearer ') ? traqoApiKey : `Bearer ${traqoApiKey}`;
 
       const fetchFromTraqo = async (withSealine: boolean) => {
         const query = withSealine && sealine ? `?sealine=${encodeURIComponent(sealine)}` : '';
@@ -144,8 +301,8 @@ async function startServer() {
         const response = await fetch(url, {
           method: 'GET',
           headers: {
-            'Authorization': authHeader,
-            'Accept': 'application/json',
+            Authorization: authHeader,
+            Accept: 'application/json',
           },
         });
 
@@ -167,8 +324,8 @@ async function startServer() {
       }
 
       if (!response.ok || !json?.success) {
-        const errorMsg = json?.message || `Traqo API error (${response.status})`;
-        console.error(`[Traqo API] Error for ${containerNumber}:`, errorMsg);
+        const errorMsg = json?.message || 'Container not found or tracking data unavailable';
+        console.error(`[Tracking API] Error for ${containerNumber}:`, errorMsg);
         return res.status(200).json({
           success: false,
           error: errorMsg,
@@ -195,7 +352,7 @@ async function startServer() {
         data: parsedData,
       });
     } catch (err: any) {
-      console.error('[Traqo API] Unexpected error:', err);
+      console.error('[Tracking API] Unexpected error:', err);
       return res.status(500).json({
         success: false,
         error: err?.message || 'Internal server error while tracking container',

@@ -1,12 +1,15 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Prevent uncaught errors from crashing the Node process
+process.on('unhandledRejection', (reason) => {
+  console.error('[Process] Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Process] Uncaught Exception:', err);
+});
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const TIMETOCARGO_DEFAULT_KEY = '6F91A193-A839-43F7-B502-187AAC5834AB';
 const TRAQO_DEFAULT_KEY = '55799d2f7c1b974351122243d097de5753752f77f5624ae080ecb45b2a95b101';
 
@@ -217,11 +220,26 @@ function parseTimeToCargoResponse(containerNumber: string, json: any) {
 async function startServer() {
   const app = express();
 
+  // Global CORS headers
+  app.use((_req: Request, res: Response, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (_req.method === 'OPTIONS') {
+      return res.status(200).end();
+    }
+    next();
+  });
+
   app.use(express.json());
 
-  // Health endpoint
+  // Health check endpoints for deployment platforms (Render, Railway, Heroku, etc.)
+  app.get('/health', (_req: Request, res: Response) => {
+    res.status(200).json({ status: 'ok', service: 'container-tracking-backend' });
+  });
+
   app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ status: 'ok', service: 'container-tracking-backend' });
+    res.status(200).json({ status: 'ok', service: 'container-tracking-backend' });
   });
 
   // Container tracking handler supporting TimeToCargo & Traqo fallback
@@ -366,22 +384,51 @@ async function startServer() {
 
   // Vite middleware in dev or static files in prod
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+    try {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } catch (viteErr) {
+      console.warn('[Server] Note: Vite dev middleware skipped, serving static files if available.');
+      const distPath = path.resolve(process.cwd(), 'dist');
+      app.use(express.static(distPath));
+      app.use((_req: Request, res: Response) => {
+        res.sendFile(path.join(distPath, 'index.html'), (err) => {
+          if (err && !res.headersSent) {
+            res.status(200).send('API Server is running.');
+          }
+        });
+      });
+    }
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.use((_req: Request, res: Response) => {
+      res.sendFile(path.join(distPath, 'index.html'), (err) => {
+        if (err && !res.headersSent) {
+          res.status(200).send('API Server is running.');
+        }
+      });
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT} (http://0.0.0.0:${PORT})`);
   });
+
+  const shutdown = (signal: string) => {
+    console.log(`[Server] ${signal} received, closing HTTP server...`);
+    server.close(() => {
+      console.log('[Server] HTTP server closed cleanly.');
+      process.exit(0);
+    });
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 startServer();

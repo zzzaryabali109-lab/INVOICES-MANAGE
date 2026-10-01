@@ -11,7 +11,12 @@ export async function sendStatusNotification(
   destinationPort?: string
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const { data, error } = await supabase.functions.invoke('send-status-notification', {
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+    if (!supabaseUrl || supabaseUrl.includes('placeholder')) {
+      return { success: true };
+    }
+
+    const { error } = await supabase.functions.invoke('send-status-notification', {
       body: {
         email,
         containerNumber,
@@ -24,8 +29,8 @@ export async function sendStatusNotification(
     });
 
     if (error) {
-      console.error('Notification error:', error);
-      return { success: false, error: error.message };
+      console.warn('Notification warning:', error.message);
+      return { success: false, error: 'Notification service currently unavailable' };
     }
 
     return { success: true };

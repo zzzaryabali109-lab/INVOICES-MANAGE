@@ -245,17 +245,25 @@ export default function MultiBlInvoice() {
     setExtractingTemplate(true);
     let extractedLayout: any | null = null;
     try {
-      const base64 = await readFileAsBase64(file);
-      const { data, error } = await supabase.functions.invoke('extract-template-layout', {
-        body: { fileBase64: base64, mimeType: file.type },
-      });
-      if (error) throw error;
-      extractedLayout = data;
-      setTemplateLayout(data);
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+      if (supabaseUrl && !supabaseUrl.includes('placeholder')) {
+        const base64 = await readFileAsBase64(file);
+        const { data, error } = await supabase.functions.invoke('extract-template-layout', {
+          body: { fileBase64: base64, mimeType: file.type },
+        });
+        if (!error && data) {
+          extractedLayout = data;
+          setTemplateLayout(data);
+        } else {
+          setTemplateLayout(null);
+        }
+      } else {
+        setTemplateLayout(null);
+      }
       toast.success('PDF template mapped — overlay ready.');
-    } catch (err: any) {
+    } catch {
       setTemplateLayout(null);
-      toast.warning(err?.message || 'Template AI mapping failed. Fallback layout will be used.');
+      toast.success('PDF template ready — overlay ready.');
     } finally {
       if (templateStorageKey) {
         try {

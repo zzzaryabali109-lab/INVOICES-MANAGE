@@ -31,50 +31,37 @@ export async function trackContainer(containerNumber: string): Promise<TrackingR
     console.warn('Backend /api/track-container error, trying fallback:', backendErr);
   }
 
-  // 2. Fallback to Supabase function
+  // 2. Fallback to Supabase function only if configured
   try {
-    const { data, error } = await supabase.functions.invoke('track-container', {
-      body: { containerNumber: cleanNumber }
-    });
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+    if (supabaseUrl && !supabaseUrl.includes('placeholder')) {
+      const { data, error } = await supabase.functions.invoke('track-container', {
+        body: { containerNumber: cleanNumber }
+      });
 
-    if (error) {
-      console.error('Edge function error:', error);
-      return {
-        success: false,
-        error: error.message || 'Failed to track container',
-        data: {
-          containerNumber: cleanNumber,
-          shippingLine: '',
-          currentLocation: '',
-          vesselName: '',
-          voyageNumber: '',
-          eta: '',
-          lastUpdate: '',
-          status: 'Not Available',
-          error: 'Tracking failed'
-        }
-      };
-    }
-
-    return data as TrackingResult;
-  } catch (err) {
-    console.error('Tracking error:', err);
-    return {
-      success: false,
-      error: 'Network error',
-      data: {
-        containerNumber: cleanNumber,
-        shippingLine: '',
-        currentLocation: '',
-        vesselName: '',
-        voyageNumber: '',
-        eta: '',
-        lastUpdate: '',
-        status: 'Not Available',
-        error: 'Network error'
+      if (!error && data && data.success) {
+        return data as TrackingResult;
       }
-    };
+    }
+  } catch (err) {
+    console.warn('Tracking fallback warning:', err);
   }
+
+  return {
+    success: false,
+    error: 'Container tracking data unavailable. Please verify container number or try again.',
+    data: {
+      containerNumber: cleanNumber,
+      shippingLine: '',
+      currentLocation: '',
+      vesselName: '',
+      voyageNumber: '',
+      eta: '',
+      lastUpdate: '',
+      status: 'Not Available',
+      error: 'Tracking data unavailable'
+    }
+  };
 }
 
 export async function trackContainers(
